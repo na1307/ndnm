@@ -15,4 +15,10 @@ internal abstract record class DotnetChannelBase {
 
     [JsonPropertyName("latest-sdk")]
     public required string LatestSdk { get; init; }
+
+    [JsonPropertyName("support-phase")]
+    public required SupportPhase SupportPhase { get; init; }
+
+    [JsonPropertyName("release-type")]
+    public required ReleaseType ReleaseType { get; init; }
 }

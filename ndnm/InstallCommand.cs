@@ -9,6 +9,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 
 namespace Ndnm;
 
@@ -20,14 +21,14 @@ internal sealed class InstallCommand(HttpClient hc) : AsyncCommand<InstallComman
     };
 
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings) {
-        var inputVersion = SemVersion.Parse(settings.Version);
+        AnsiConsole.Markup("[yellow]Fetching release information...[/]");
 
-        if (inputVersion.Patch < 100) {
-            throw new NotSupportedException("This program only supports downloading the .NET SDK, not the runtime.");
-        }
+        var (inputVersion, sdkFiles, runtimeVersion) = await ResolveSdkAsync(settings.Version);
 
-        var jsonPath = Path.Combine( /*Constants.NdnmPath*/ AppContext.BaseDirectory, "instances.json");
-        var rid = $"{Constants.OSName}-{Constants.OSArch}";
+        AnsiConsole.MarkupLine(" [green]Done.[/]");
+
+        var jsonPath = Path.Combine( /*NdnmPath*/ AppContext.BaseDirectory, "instances.json");
+        var rid = $"{OSName}-{OSArch}";
 
         if (File.Exists(jsonPath)) {
             await using FileStream fs = new(jsonPath, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, true);
@@ -37,33 +38,13 @@ internal sealed class InstallCommand(HttpClient hc) : AsyncCommand<InstallComman
             }
         }
 
-        AnsiConsole.Markup("[yellow]Fetching release information...[/]");
-
-        var dri = await hc.GetFromJsonAsync(ReleasesIndexJson, NdnmJsonSerializerContext.Default.DotnetReleasesIndex);
-        var releases = await dri.Releases.ToAsyncEnumerable().SelectMany(CollectionSelector).ToArrayAsync();
-        var release = releases.SingleOrDefault(r => SemVersion.Parse(r.Sdk.Version) == inputVersion);
-        DotnetFile[] sdkFiles;
-        string runtimeVersion;
-
-        if (release != default) {
-            sdkFiles = release.Sdk.Files;
-            runtimeVersion = release.Sdk.RuntimeVersion!;
-        } else {
-            var sdk = releases.SelectMany(r => r.Sdks ?? []).SingleOrDefault(s => SemVersion.Parse(s.Version) == inputVersion);
-
-            if (sdk == default) {
-                throw new InvalidOperationException("Could not find a release matching the specified version.");
-            }
-
-            sdkFiles = sdk.Files;
-            runtimeVersion = sdk.RuntimeVersion!;
-        }
-
-        var sdkFile = sdkFiles.SingleOrDefault(f => f.RuntimeIdentifier == rid);
+        var sdkFile = sdkFiles.SingleOrDefault(f => f.RuntimeIdentifier == rid && IsAppropriateFile(f));
 
         if (sdkFile == default) {
             throw new InvalidOperationException("Could not find a release matching the specified version.");
         }
+
+        AnsiConsole.Markup("[yellow]Fetching file information...[/]");
 
         // 파일 크기 정보 가져오기
         long totalSize;
@@ -78,6 +59,7 @@ internal sealed class InstallCommand(HttpClient hc) : AsyncCommand<InstallComman
         }
 
         AnsiConsole.MarkupLine(" [green]Done.[/]");
+        AnsiConsole.MarkupLine($"[purple]Installing .NET SDK {inputVersion}...[/]");
 
         return await AnsiConsole.Progress()
             .Columns(new TaskDescriptionColumn(), new ProgressBarColumn(), new PercentageColumn(), new RemainingTimeColumn(), new SpinnerColumn())
@@ -87,7 +69,7 @@ internal sealed class InstallCommand(HttpClient hc) : AsyncCommand<InstallComman
                 var extractTask = ctx.AddTask("[yellow]Extracting .NET SDK[/]");
                 var fileExtension = GetFileExtension(sdkFile.Url);
                 var fileName = Path.Combine(AppContext.BaseDirectory, $"dotnet.{fileExtension}");
-                var tempDirPath = Path.Combine( /*Constants.NdnmPath*/ AppContext.BaseDirectory, "temp");
+                var tempDirPath = Path.Combine( /*NdnmPath*/ AppContext.BaseDirectory, "temp");
                 DirectoryInfo tempDir = new(tempDirPath);
 
                 File.Delete(fileName);
@@ -195,7 +177,7 @@ internal sealed class InstallCommand(HttpClient hc) : AsyncCommand<InstallComman
                         inputIsGreater = cliVersion is null || SemVersion.Parse(cliVersion.GetValue<string>()).ComparePrecedenceTo(inputVersion) < 0;
                     }
 
-                    var instanceDir = Directory.CreateDirectory(Path.Combine( /*Constants.NdnmPath*/ AppContext.BaseDirectory, rid));
+                    var instanceDir = Directory.CreateDirectory(Path.Combine( /*NdnmPath*/ AppContext.BaseDirectory, rid));
 
                     foreach (var file in tempDir.EnumerateFiles("*", SearchOption.AllDirectories)) {
                         var dest = Path.Combine(instanceDir.FullName, Path.GetRelativePath(tempDir.FullName, file.FullName));
@@ -218,7 +200,7 @@ internal sealed class InstallCommand(HttpClient hc) : AsyncCommand<InstallComman
                             rootObject[dotnetCli] = inputVersion.ToString();
                         }
 
-                        rootObject[rid]!.AsObject()[inputVersion.ToString()] = runtimeVersion;
+                        rootObject[rid]!.AsObject()[inputVersion.ToString()] = runtimeVersion.ToString();
                         jsonFile.Position = 0;
                         await using Utf8JsonWriter writer = new(jsonFile, IndentedWriterOptions);
 
@@ -266,18 +248,124 @@ internal sealed class InstallCommand(HttpClient hc) : AsyncCommand<InstallComman
                 }
             });
 
-        async ValueTask<IEnumerable<DotnetRelease>> CollectionSelector(DotnetChannelReleasesIndex releasesIndex, CancellationToken ct) {
-            var channel = await hc.GetFromJsonAsync(releasesIndex.ReleasesJson, NdnmJsonSerializerContext.Default.DotnetChannel, ct);
+        static bool IsAppropriateFile(DotnetFile file) {
+            var fileExtension = Path.GetExtension(file.Url.LocalPath);
 
-            return channel!.Releases;
+            switch (OSName) {
+                case "linux" when fileExtension == ".gz":
+                case "windows" when fileExtension == ".zip":
+                    return true;
+
+                default:
+                    return false;
+            }
+        }
+
+        async Task<(SemVersion, DotnetFile[], SemVersion)> ResolveSdkAsync(string versionPattern) {
+            var dri = await hc.GetFromJsonAsync(ReleasesIndexJson, NdnmJsonSerializerContext.Default.DotnetReleasesIndex);
+            var channels = await dri.Releases.ToAsyncEnumerable().Select(CollectionSelector).ToArrayAsync();
+            var releases = channels.SelectMany(c => c.Releases).ToArray();
+
+            // 모든 SDK 수집
+            var allSdks = releases
+                .Select(r => r.Sdk)
+                .Concat(releases.SelectMany(r => r.Sdks ?? []))
+                .Distinct()
+                .OrderByDescending(s => SemVersion.Parse(s.Version), SemVersionComparer.Default)
+                .ToArray();
+
+            var resolvedSdk = ResolveSdkVersionPattern(versionPattern, channels, allSdks)
+                ?? throw new InvalidOperationException("Could not find a release matching the specified version.");
+
+            return (SemVersion.Parse(resolvedSdk.Version), resolvedSdk.Files, SemVersion.Parse(resolvedSdk.RuntimeVersion!));
+
+            async ValueTask<DotnetChannel> CollectionSelector(DotnetChannelReleasesIndex releasesIndex, CancellationToken ct)
+                => (await hc.GetFromJsonAsync(releasesIndex.ReleasesJson, NdnmJsonSerializerContext.Default.DotnetChannel, ct))!;
+
+            static DotnetSdk? ResolveSdkVersionPattern(string pattern, DotnetChannel[] channels, DotnetSdk[] availableSdks) {
+                // 이미 정확한 버전이면 그대로 반환
+                if (SemVersion.TryParse(pattern, out var sv)) {
+                    return availableSdks.SingleOrDefault(s => SemVersion.Parse(s.Version) == sv);
+                }
+
+                // latest 패턴
+                if (pattern.Equals("latest", StringComparison.OrdinalIgnoreCase)) {
+                    var latestStableChannel = channels.First(c => c.SupportPhase == SupportPhase.Active);
+
+                    return availableSdks.FirstOrDefault(s => latestStableChannel.LatestSdk == s.Version);
+                }
+
+                // lts 패턴 (6.0, 8.0이 LTS)
+                if (pattern.Equals("lts", StringComparison.OrdinalIgnoreCase)) {
+                    var latestLtsChannel = channels.First(c => c is { SupportPhase: SupportPhase.Active, ReleaseType: ReleaseType.Lts });
+
+                    return availableSdks.FirstOrDefault(s => latestLtsChannel.LatestSdk == s.Version);
+                }
+
+                // 단일 숫자 (예: "9" -> 9.x.x 최신)
+                if (int.TryParse(pattern, out var majorOnly)) {
+                    return availableSdks.FirstOrDefault(s => {
+                        var v = SemVersion.Parse(s.Version);
+
+                        return v.Major == majorOnly;
+                    });
+                }
+
+                // 9.0.x 패턴 처리
+                if (pattern.EndsWith(".x")) {
+                    var prefix = pattern[..^2]; // ".x" 제거
+                    var parts = prefix.Split('.');
+
+                    if (parts.Length == 2 && int.TryParse(parts[0], out var major) && int.TryParse(parts[1], out var minor)) {
+                        return availableSdks.FirstOrDefault(s => {
+                            var v = SemVersion.Parse(s.Version);
+
+                            return v.Major == major && v.Minor == minor;
+                        }); // 이미 내림차순 정렬되어 있음
+                    }
+                }
+
+                // 9.0.1xx 패턴 처리
+                if (pattern.EndsWith("xx")) {
+                    var prefix = pattern[..^2]; // "xx" 제거
+                    var parts = prefix.Split('.');
+
+                    if (parts.Length == 3 &&
+                        int.TryParse(parts[0], out var major) &&
+                        int.TryParse(parts[1], out var minor) &&
+                        int.TryParse(parts[2], out var patchPrefix)) {
+                        // 예: 9.0.1xx -> 100~199 범위에서 찾기
+                        var minPatch = patchPrefix * 100;
+                        var maxPatch = minPatch + 99;
+
+                        return availableSdks.FirstOrDefault(s => {
+                            var v = SemVersion.Parse(s.Version);
+
+                            return v.Major == major && v.Minor == minor && v.Patch >= minPatch && v.Patch <= maxPatch;
+                        });
+                    }
+                }
+
+                return null;
+            }
         }
     }
 
     public override ValidationResult Validate(CommandContext context, Settings settings) {
-        var inputVersion = SemVersion.Parse(settings.Version);
-
-        if (inputVersion.Patch < 100) {
+        if (SemVersion.TryParse(settings.Version, out var semver) && semver.Patch < 100) {
             return ValidationResult.Error("This program only supports downloading the .NET SDK, not the runtime.");
+        }
+
+        if (!Regex.IsMatch(settings.Version, @"([0-9]+(\.[0-9]+\.([0-9]{3,3}|[0-9]xx|x))?|lts|latest)")) {
+            return ValidationResult.Error("""
+                                          Invalid version format. Please use the following format:
+                                            - 9.0.100 (exact version)
+                                            - 9.0.1xx (latest patch of major.minor.feature band)
+                                            - 9.0.x (latest major.minor.patch)
+                                            - 9 (latest version of major version)
+                                            - lts (latest long-term support version)
+                                            - latest (latest stable version)
+                                          """);
         }
 
         return ValidationResult.Success();
