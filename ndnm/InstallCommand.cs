@@ -21,11 +21,8 @@ internal sealed class InstallCommand(HttpClient hc) : AsyncCommand<InstallComman
     };
 
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings) {
-        AnsiConsole.Markup("[yellow]Fetching release information...[/]");
-
-        var (inputVersion, sdkFiles, runtimeVersion) = await ResolveSdkAsync(settings.Version);
-
-        AnsiConsole.MarkupLine(" [green]Done.[/]");
+        var (inputVersion, sdkFiles, runtimeVersion)
+            = settings.Version is not null ? await ResolveSdkAsync(settings.Version) : await ResolveFromGlobalJsonAsync();
 
         var jsonPath = Path.Combine( /*NdnmPath*/ AppContext.BaseDirectory, "instances.json");
         var rid = $"{OSName}-{OSArch}";
@@ -34,7 +31,7 @@ internal sealed class InstallCommand(HttpClient hc) : AsyncCommand<InstallComman
             await using FileStream fs = new(jsonPath, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, true);
 
             if ((await JsonNode.ParseAsync(fs))!.AsObject()[rid]!.AsObject()[inputVersion.ToString()] is not null) {
-                throw new InvalidOperationException("This version of .NET is already installed.");
+                throw new InvalidOperationException($".NET SDK {inputVersion} is already installed.");
             }
         }
 
@@ -262,6 +259,8 @@ internal sealed class InstallCommand(HttpClient hc) : AsyncCommand<InstallComman
         }
 
         async Task<(SemVersion, DotnetFile[], SemVersion)> ResolveSdkAsync(string versionPattern) {
+            AnsiConsole.Markup("[yellow]Fetching release information...[/]");
+
             var dri = await hc.GetFromJsonAsync(ReleasesIndexJson, NdnmJsonSerializerContext.Default.DotnetReleasesIndex);
             var channels = await dri.Releases.ToAsyncEnumerable().Select(CollectionSelector).ToArrayAsync();
             var releases = channels.SelectMany(c => c.Releases).ToArray();
@@ -277,6 +276,8 @@ internal sealed class InstallCommand(HttpClient hc) : AsyncCommand<InstallComman
             var resolvedSdk = ResolveSdkVersionPattern(versionPattern, channels, allSdks)
                 ?? throw new InvalidOperationException("Could not find a release matching the specified version.");
 
+            AnsiConsole.MarkupLine(" [green]Done.[/]");
+
             return (SemVersion.Parse(resolvedSdk.Version), resolvedSdk.Files, SemVersion.Parse(resolvedSdk.RuntimeVersion!));
 
             async ValueTask<DotnetChannel> CollectionSelector(DotnetChannelReleasesIndex releasesIndex, CancellationToken ct)
@@ -285,7 +286,13 @@ internal sealed class InstallCommand(HttpClient hc) : AsyncCommand<InstallComman
             static DotnetSdk? ResolveSdkVersionPattern(string pattern, DotnetChannel[] channels, DotnetSdk[] availableSdks) {
                 // 이미 정확한 버전이면 그대로 반환
                 if (SemVersion.TryParse(pattern, out var sv)) {
-                    return availableSdks.SingleOrDefault(s => SemVersion.Parse(s.Version) == sv);
+                    var value = availableSdks.FirstOrDefault(s => SemVersion.Parse(s.Version) == sv);
+
+                    if (value != default) {
+                        return value;
+                    }
+
+                    return availableSdks.FirstOrDefault(s => SemVersion.Parse(s.DisplayVersion) == sv);
                 }
 
                 // latest 패턴
@@ -349,6 +356,37 @@ internal sealed class InstallCommand(HttpClient hc) : AsyncCommand<InstallComman
                 return null;
             }
         }
+
+        async Task<(SemVersion, DotnetFile[], SemVersion)> ResolveFromGlobalJsonAsync() {
+            var globalJsonPath = FindGlobalJson() ?? throw new InvalidOperationException(
+                "No version was specified and global.json was not found. Specify a version explicitly or run from the directory where global.json is located.");
+
+            AnsiConsole.MarkupLine($"[cyan]Found global.json: {globalJsonPath}[/]");
+
+            await using FileStream fs = new(globalJsonPath, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, true);
+            var globalJson = await JsonNode.ParseAsync(fs);
+
+            var sdkVersion = globalJson?["sdk"]?["version"]?.GetValue<string>()
+                ?? throw new InvalidOperationException("SDK version not found in global.json.");
+
+            return await ResolveSdkAsync(sdkVersion);
+
+            static string? FindGlobalJson() {
+                DirectoryInfo? currentDir = new(Environment.CurrentDirectory);
+
+                while (currentDir != null) {
+                    var globalJsonPath = Path.Combine(currentDir.FullName, "global.json");
+
+                    if (File.Exists(globalJsonPath)) {
+                        return globalJsonPath;
+                    }
+
+                    currentDir = currentDir.Parent;
+                }
+
+                return null;
+            }
+        }
     }
 
     public override ValidationResult Validate(CommandContext context, Settings settings) {
@@ -356,7 +394,7 @@ internal sealed class InstallCommand(HttpClient hc) : AsyncCommand<InstallComman
             return ValidationResult.Error("This program only supports downloading the .NET SDK, not the runtime.");
         }
 
-        if (!Regex.IsMatch(settings.Version, @"([0-9]+(\.[0-9]+\.([0-9]{3,3}|[0-9]xx|x))?|lts|latest)")) {
+        if (settings.Version is not null && !Regex.IsMatch(settings.Version, @"([0-9]+(\.[0-9]+\.([0-9]{3,3}|[0-9]xx|x))?|lts|latest)")) {
             return ValidationResult.Error("""
                                           Invalid version format. Please use the following format:
                                             - 9.0.100 (exact version)
@@ -372,9 +410,9 @@ internal sealed class InstallCommand(HttpClient hc) : AsyncCommand<InstallComman
     }
 
     internal sealed class Settings : CommandSettings {
-        [CommandArgument(0, "<version>")]
+        [CommandArgument(0, "[version]")]
         [Description("The version to install.")]
-        public required string Version { get; init; }
+        public string? Version { get; init; }
 
         [CommandOption("--hash", IsHidden = true)]
         [Description("Show the hash of the downloaded file.")]
