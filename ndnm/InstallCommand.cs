@@ -20,10 +20,11 @@ internal sealed class InstallCommand(HttpClient hc) : AsyncCommand<InstallComman
             throw new NotSupportedException("This program only supports downloading the .NET SDK, not the runtime.");
         }
 
+        AnsiConsole.Markup("[yellow]Fetching release information...[/]");
+
         var dri = await hc.GetFromJsonAsync(ReleasesIndexJson, NdnmJsonSerializerContext.Default.DotnetReleasesIndex);
         var releases = await dri.Releases.ToAsyncEnumerable().SelectMany(CollectionSelector).ToArrayAsync();
         var release = releases.SingleOrDefault(r => SemVersion.Parse(r.Sdk.Version) == inputVersion);
-
         DotnetFile[] sdkFiles;
 
         if (release != default) {
@@ -46,13 +47,18 @@ internal sealed class InstallCommand(HttpClient hc) : AsyncCommand<InstallComman
         }
 
         // 파일 크기 정보 가져오기
-        using HttpRequestMessage message = new(HttpMethod.Head, sdkFile.Url);
-        using var headResponse = await hc.SendAsync(message);
-        var totalSize = headResponse.Content.Headers.ContentLength ?? 0;
+        long totalSize;
+
+        using (HttpRequestMessage message = new(HttpMethod.Head, sdkFile.Url))
+        using (var headResponse = await hc.SendAsync(message)) {
+            totalSize = headResponse.Content.Headers.ContentLength ?? 0;
+        }
 
         if (totalSize == 0) {
             throw new InvalidOperationException("Something went wrong.");
         }
+
+        AnsiConsole.MarkupLine(" [green]Done.[/]");
 
         return await AnsiConsole.Progress()
             .Columns(new TaskDescriptionColumn(), new ProgressBarColumn(), new PercentageColumn(), new RemainingTimeColumn(), new SpinnerColumn())
@@ -60,51 +66,61 @@ internal sealed class InstallCommand(HttpClient hc) : AsyncCommand<InstallComman
                 var downloadTask = ctx.AddTask("[green]Downloading .NET SDK[/]", maxValue: totalSize);
                 var hashTask = ctx.AddTask("[blue]Calculating hash[/]", maxValue: totalSize);
                 var extractTask = ctx.AddTask("[yellow]Extracting .NET SDK[/]");
-                var fileName = $"dotnet.{GetFileExtension(sdkFile.Url)}";
+                var fileExtension = GetFileExtension(sdkFile.Url);
+                var fileName = Path.Combine(AppContext.BaseDirectory, $"dotnet.{fileExtension}");
+                var tempDirPath = Path.Combine( /*Constants.NdnmPath*/ AppContext.BaseDirectory, "temp");
+                DirectoryInfo tempDir = new(tempDirPath);
 
                 File.Delete(fileName);
 
                 try {
-                    using var sha512 = SHA512.Create();
+                    await using FileStream fs = new(fileName, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, 81920, true);
+                    byte[] calculatedHash;
 
-                    await using (FileStream fs = new(fileName, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, 81920, true)) {
-                        await using var response = await hc.GetStreamAsync(sdkFile.Url);
-                        var stopwatch = Stopwatch.StartNew();
-                        var buffer = new byte[81920]; // 더 큰 버퍼로 성능 향상
-                        int bytesRead;
-                        long totalBytesRead = 0;
+                    using (var sha512 = SHA512.Create()) {
+                        await using (var response = await hc.GetStreamAsync(sdkFile.Url)) {
+                            var stopwatch = Stopwatch.StartNew();
+                            var buffer = new byte[81920]; // 더 큰 버퍼로 성능 향상
+                            int bytesRead;
+                            long totalBytesRead = 0;
 
-                        while ((bytesRead = await response.ReadAsync(buffer)) > 0) {
-                            // 파일에 쓰기
-                            await fs.WriteAsync(buffer.AsMemory(0, bytesRead));
+                            while ((bytesRead = await response.ReadAsync(buffer)) > 0) {
+                                // 파일에 쓰기
+                                await fs.WriteAsync(buffer.AsMemory(0, bytesRead));
 
-                            // 해시 계산
-                            sha512.TransformBlock(buffer, 0, bytesRead, null, 0);
+                                // 해시 계산
+                                sha512.TransformBlock(buffer, 0, bytesRead, null, 0);
 
-                            totalBytesRead += bytesRead;
-                            downloadTask.Value = totalBytesRead;
-                            hashTask.Value = totalBytesRead;
+                                totalBytesRead += bytesRead;
+                                downloadTask.Value = totalBytesRead;
+                                hashTask.Value = totalBytesRead;
 
-                            // 다운로드 속도 표시
-                            var elapsed = stopwatch.Elapsed.TotalSeconds;
+                                // 다운로드 속도 표시
+                                var elapsed = stopwatch.Elapsed.TotalSeconds;
 
-                            if (elapsed > 0) {
-                                var speed = totalBytesRead / elapsed / 1024 / 1024; // MB/s
-                                downloadTask.Description = $"[green]Downloading .NET SDK[/] ({speed:F1} MB/s)";
+                                if (elapsed > 0) {
+                                    var speed = totalBytesRead / elapsed / 1024 / 1024; // MB/s
+                                    downloadTask.Description = $"[green]Downloading .NET SDK[/] ({speed:F1} MB/s)";
+                                }
                             }
                         }
+
+                        // 해시 최종 계산
+                        sha512.TransformFinalBlock([], 0, 0);
+
+                        calculatedHash = sha512.Hash!;
                     }
 
-                    // 해시 최종 계산
-                    sha512.TransformFinalBlock([], 0, 0);
-
-                    var calculatedHash = sha512.Hash!;
                     downloadTask.Value = totalSize;
                     hashTask.Value = totalSize;
-#if DEBUG
-                    AnsiConsole.WriteLine($"Original hash:   {sdkFile.Sha512Hash.ToUpperInvariant()}");
-                    AnsiConsole.WriteLine($"Calculated hash: {ByteArrayToString(calculatedHash).ToUpperInvariant()}");
-#endif
+
+                    AnsiConsole.MarkupLine("[green]Download completed successfully![/]");
+
+                    if (settings.ShowHash) {
+                        AnsiConsole.WriteLine($"Original hash:   {sdkFile.Sha512Hash.ToUpperInvariant()}");
+                        AnsiConsole.WriteLine($"Calculated hash: {ByteArrayToString(calculatedHash).ToUpperInvariant()}");
+                    }
+
                     if (!calculatedHash.AsSpan().SequenceEqual(StringToByteArray(sdkFile.Sha512Hash))) {
                         AnsiConsole.MarkupLine("[red]Hash mismatch![/]");
 
@@ -113,27 +129,46 @@ internal sealed class InstallCommand(HttpClient hc) : AsyncCommand<InstallComman
 
                     AnsiConsole.MarkupLine("[green]Hash verified successfully![/]");
 
-                    var extractPath = Path.Combine( /*Constants.NdnmPath*/ AppContext.BaseDirectory, rid);
+                    if (tempDir.Exists) {
+                        tempDir.Delete(true);
+                    }
 
-                    Directory.CreateDirectory(extractPath);
+                    tempDir = Directory.CreateDirectory(tempDirPath);
+                    fs.Position = 0;
+                    var fileSize = fs.Length;
+                    extractTask.MaxValue = fileSize;
 
-                    await using (FileStream tarGzFileStream = new(fileName, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, true)) {
-                        var tarGzTotalSize = tarGzFileStream.Length;
-                        extractTask.MaxValue = tarGzTotalSize;
+                    switch (fileExtension) {
+                        case "tar.gz":
+                            await using (GZipStream gzStream = new(fs, CompressionMode.Decompress))
+                            await using (ReadProgressStream read = new(gzStream, progress => extractTask.Value = Math.Min(progress, fileSize))) {
+                                await TarFile.ExtractToDirectoryAsync(read, tempDir.FullName, true);
+                            }
 
-                        await using (GZipStream gzStream = new(tarGzFileStream, CompressionMode.Decompress))
-                        await using (ReadProgressStream readProgressStream
-                                     = new(gzStream, progress => extractTask.Value = Math.Min(progress, tarGzTotalSize))) {
-                            await TarFile.ExtractToDirectoryAsync(readProgressStream, extractPath, true);
-                        }
+                            break;
 
-                        extractTask.Value = tarGzTotalSize;
+                        default:
+                            throw new InvalidOperationException("Something went wrong.");
+                    }
+
+                    extractTask.Value = fileSize;
+                    var instanceDir = Directory.CreateDirectory(Path.Combine( /*Constants.NdnmPath*/ AppContext.BaseDirectory, rid));
+
+                    foreach (var file in tempDir.EnumerateFiles("*", SearchOption.AllDirectories)) {
+                        var dest = Path.Combine(instanceDir.FullName, Path.GetRelativePath(tempDir.FullName, file.FullName));
+
+                        Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
+                        file.MoveTo(dest, true);
                     }
 
                     AnsiConsole.MarkupLine("[green]Extraction completed successfully![/]");
 
                     return 0;
                 } finally {
+                    if (tempDir.Exists) {
+                        tempDir.Delete(true);
+                    }
+
                     File.Delete(fileName);
                 }
 
@@ -179,5 +214,9 @@ internal sealed class InstallCommand(HttpClient hc) : AsyncCommand<InstallComman
         [CommandArgument(0, "<version>")]
         [Description("The version to install.")]
         public required string Version { get; init; }
+
+        [CommandOption("--hash", IsHidden = true)]
+        [Description("Show the hash of the downloaded file.")]
+        public bool ShowHash { get; init; }
     }
 }
