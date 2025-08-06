@@ -7,11 +7,17 @@ using System.IO.Compression;
 using System.Net.Http.Json;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 
 namespace Ndnm;
 
 internal sealed class InstallCommand(HttpClient hc) : AsyncCommand<InstallCommand.Settings> {
     private static readonly Uri ReleasesIndexJson = new("https://builds.dotnet.microsoft.com/dotnet/release-metadata/releases-index.json");
+
+    private static readonly JsonWriterOptions IndentedWriterOptions = new() {
+        Indented = true
+    };
 
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings) {
         var inputVersion = SemVersion.Parse(settings.Version);
@@ -20,15 +26,28 @@ internal sealed class InstallCommand(HttpClient hc) : AsyncCommand<InstallComman
             throw new NotSupportedException("This program only supports downloading the .NET SDK, not the runtime.");
         }
 
+        var jsonPath = Path.Combine( /*Constants.NdnmPath*/ AppContext.BaseDirectory, "instances.json");
+        var rid = $"{Constants.OSName}-{Constants.OSArch}";
+
+        if (File.Exists(jsonPath)) {
+            await using FileStream fs = new(jsonPath, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, true);
+
+            if ((await JsonNode.ParseAsync(fs))!.AsObject()[rid]!.AsObject()[inputVersion.ToString()] is not null) {
+                throw new InvalidOperationException("This version of .NET is already installed.");
+            }
+        }
+
         AnsiConsole.Markup("[yellow]Fetching release information...[/]");
 
         var dri = await hc.GetFromJsonAsync(ReleasesIndexJson, NdnmJsonSerializerContext.Default.DotnetReleasesIndex);
         var releases = await dri.Releases.ToAsyncEnumerable().SelectMany(CollectionSelector).ToArrayAsync();
         var release = releases.SingleOrDefault(r => SemVersion.Parse(r.Sdk.Version) == inputVersion);
         DotnetFile[] sdkFiles;
+        string runtimeVersion;
 
         if (release != default) {
             sdkFiles = release.Sdk.Files;
+            runtimeVersion = release.Sdk.RuntimeVersion!;
         } else {
             var sdk = releases.SelectMany(r => r.Sdks ?? []).SingleOrDefault(s => SemVersion.Parse(s.Version) == inputVersion);
 
@@ -37,9 +56,9 @@ internal sealed class InstallCommand(HttpClient hc) : AsyncCommand<InstallComman
             }
 
             sdkFiles = sdk.Files;
+            runtimeVersion = sdk.RuntimeVersion!;
         }
 
-        var rid = $"{Constants.OSName}-{Constants.OSArch}";
         var sdkFile = sdkFiles.SingleOrDefault(f => f.RuntimeIdentifier == rid);
 
         if (sdkFile == default) {
@@ -74,10 +93,11 @@ internal sealed class InstallCommand(HttpClient hc) : AsyncCommand<InstallComman
                 File.Delete(fileName);
 
                 try {
-                    await using FileStream fs = new(fileName, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None, 81920, true);
                     byte[] calculatedHash;
 
-                    using (var sha512 = SHA512.Create()) {
+                    await using (FileStream fs = new(fileName, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, true)) {
+                        using var sha512 = SHA512.Create();
+
                         await using (var response = await hc.GetStreamAsync(sdkFile.Url)) {
                             var stopwatch = Stopwatch.StartNew();
                             var buffer = new byte[81920]; // 더 큰 버퍼로 성능 향상
@@ -134,36 +154,100 @@ internal sealed class InstallCommand(HttpClient hc) : AsyncCommand<InstallComman
                     }
 
                     tempDir = Directory.CreateDirectory(tempDirPath);
-                    fs.Position = 0;
-                    var fileSize = fs.Length;
-                    extractTask.MaxValue = fileSize;
 
-                    switch (fileExtension) {
-                        case "tar.gz":
-                            await using (GZipStream gzStream = new(fs, CompressionMode.Decompress))
-                            await using (ReadProgressStream read = new(gzStream, progress => extractTask.Value = Math.Min(progress, fileSize))) {
-                                await TarFile.ExtractToDirectoryAsync(read, tempDir.FullName, true);
-                            }
+                    await using (FileStream fs = new(fileName, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, true)) {
+                        var fileSize = fs.Length;
+                        extractTask.MaxValue = fileSize;
 
-                            break;
+                        switch (fileExtension) {
+                            case "tar.gz":
+                                await using (GZipStream gzStream = new(fs, CompressionMode.Decompress))
+                                await using (ReadProgressStream read = new(gzStream, progress => extractTask.Value = Math.Min(progress, fileSize))) {
+                                    await TarFile.ExtractToDirectoryAsync(read, tempDir.FullName, true);
+                                }
 
-                        default:
-                            throw new InvalidOperationException("Something went wrong.");
+                                break;
+
+                            default:
+                                throw new InvalidOperationException("Something went wrong.");
+                        }
+
+                        extractTask.Value = fileSize;
                     }
 
-                    extractTask.Value = fileSize;
+                    const string dotnetCli = "dotnet-cli";
+
+                    if (!File.Exists(jsonPath)) {
+                        await using FileStream newJsonFile = new(jsonPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096, true);
+                        await using Utf8JsonWriter writer = new(newJsonFile, IndentedWriterOptions);
+
+                        writer.WriteStartObject();
+                        writer.WriteNull(dotnetCli);
+                        writer.WriteStartObject(rid);
+                        writer.WriteEndObject();
+                        writer.WriteEndObject();
+                    }
+
+                    bool inputIsGreater;
+
+                    await using (FileStream jsonFile = new(jsonPath, FileMode.Open, FileAccess.Read, FileShare.Read, 4096, true)) {
+                        var cliVersion = (await JsonNode.ParseAsync(jsonFile))!.AsObject()[dotnetCli];
+                        inputIsGreater = cliVersion is null || SemVersion.Parse(cliVersion.GetValue<string>()).ComparePrecedenceTo(inputVersion) < 0;
+                    }
+
                     var instanceDir = Directory.CreateDirectory(Path.Combine( /*Constants.NdnmPath*/ AppContext.BaseDirectory, rid));
 
                     foreach (var file in tempDir.EnumerateFiles("*", SearchOption.AllDirectories)) {
                         var dest = Path.Combine(instanceDir.FullName, Path.GetRelativePath(tempDir.FullName, file.FullName));
 
                         Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
-                        file.MoveTo(dest, true);
+
+                        if (!inputIsGreater) {
+                            if (!File.Exists(dest)) {
+                                file.MoveTo(dest, false);
+                            }
+                        } else {
+                            file.MoveTo(dest, true);
+                        }
+                    }
+
+                    await using (FileStream jsonFile = new(jsonPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None, 4096, true)) {
+                        var rootObject = (await JsonNode.ParseAsync(jsonFile))!.AsObject();
+
+                        if (inputIsGreater) {
+                            rootObject[dotnetCli] = inputVersion.ToString();
+                        }
+
+                        rootObject[rid]!.AsObject()[inputVersion.ToString()] = runtimeVersion;
+                        jsonFile.Position = 0;
+                        await using Utf8JsonWriter writer = new(jsonFile, IndentedWriterOptions);
+
+                        rootObject.WriteTo(writer);
                     }
 
                     AnsiConsole.MarkupLine("[green]Extraction completed successfully![/]");
 
                     return 0;
+
+                    static string ByteArrayToString(byte[] arrInput) {
+                        StringBuilder sOutput = new(arrInput.Length);
+
+                        foreach (var t in arrInput) {
+                            sOutput.Append(t.ToString("X2"));
+                        }
+
+                        return sOutput.ToString();
+                    }
+
+                    static ReadOnlySpan<byte> StringToByteArray(string strInput) {
+                        var bytes = new byte[strInput.Length / 2];
+
+                        for (var i = 0; i < strInput.Length; i += 2) {
+                            bytes[i / 2] = Convert.ToByte(strInput.Substring(i, 2), 16);
+                        }
+
+                        return bytes;
+                    }
                 } finally {
                     if (tempDir.Exists) {
                         tempDir.Delete(true);
@@ -179,27 +263,6 @@ internal sealed class InstallCommand(HttpClient hc) : AsyncCommand<InstallComman
                         ".gz" => "tar.gz",
                         _ => extension.TrimStart('.')
                     };
-                }
-
-                static string ByteArrayToString(byte[] arrInput) {
-                    int i;
-                    StringBuilder sOutput = new(arrInput.Length);
-
-                    for (i = 0; i < arrInput.Length; i++) {
-                        sOutput.Append(arrInput[i].ToString("X2"));
-                    }
-
-                    return sOutput.ToString();
-                }
-
-                static ReadOnlySpan<byte> StringToByteArray(string strInput) {
-                    var bytes = new byte[strInput.Length / 2];
-
-                    for (var i = 0; i < strInput.Length; i += 2) {
-                        bytes[i / 2] = Convert.ToByte(strInput.Substring(i, 2), 16);
-                    }
-
-                    return bytes;
                 }
             });
 
