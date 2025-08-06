@@ -210,6 +210,16 @@ internal sealed class InstallCommand(HttpClient hc) : AsyncCommand<InstallComman
         }
     }
 
+    public override ValidationResult Validate(CommandContext context, Settings settings) {
+        var inputVersion = SemVersion.Parse(settings.Version);
+
+        if (inputVersion.Patch < 100) {
+            return ValidationResult.Error("This program only supports downloading the .NET SDK, not the runtime.");
+        }
+
+        return ValidationResult.Success();
+    }
+
     internal sealed class Settings : CommandSettings {
         [CommandArgument(0, "<version>")]
         [Description("The version to install.")]
