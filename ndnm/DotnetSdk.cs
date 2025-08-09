@@ -5,7 +5,7 @@ internal readonly record struct DotnetSdk {
     public required string Version { get; init; }
 
     [JsonPropertyName("version-display")]
-    public required string DisplayVersion { get; init; }
+    public required string? DisplayVersion { get; init; }
 
     [JsonPropertyName("runtime-version")]
     public string? RuntimeVersion { get; init; }

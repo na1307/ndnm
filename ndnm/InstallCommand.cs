@@ -35,11 +35,8 @@ internal sealed class InstallCommand(HttpClient hc) : AsyncCommand<InstallComman
             }
         }
 
-        var sdkFile = sdkFiles.SingleOrDefault(f => f.RuntimeIdentifier == rid && IsAppropriateFile(f));
-
-        if (sdkFile == default) {
-            throw new InvalidOperationException("Could not find a release matching the specified version.");
-        }
+        var sdkFile = sdkFiles.Select(f => f.RuntimeIdentifier == rid && IsAppropriateFile(f) ? f : (DotnetFile?)null)
+            .SingleOrDefault(f => f is not null) ?? throw new InvalidOperationException("Could not find a release matching the specified version.");
 
         AnsiConsole.Markup("[yellow]Fetching file information...[/]");
 
@@ -250,7 +247,7 @@ internal sealed class InstallCommand(HttpClient hc) : AsyncCommand<InstallComman
 
             switch (OSName) {
                 case "linux" when fileExtension == ".gz":
-                case "windows" when fileExtension == ".zip":
+                case "win" when fileExtension == ".zip":
                     return true;
 
                 default:
@@ -286,13 +283,11 @@ internal sealed class InstallCommand(HttpClient hc) : AsyncCommand<InstallComman
             static DotnetSdk? ResolveSdkVersionPattern(string pattern, DotnetChannel[] channels, DotnetSdk[] availableSdks) {
                 // 이미 정확한 버전이면 그대로 반환
                 if (SemVersion.TryParse(pattern, out var sv)) {
-                    var value = availableSdks.FirstOrDefault(s => SemVersion.Parse(s.Version) == sv);
+                    var value = availableSdks.Select(s => SemVersion.Parse(s.Version) == sv ? s : (DotnetSdk?)null).FirstOrDefault();
 
-                    if (value != default) {
-                        return value;
-                    }
-
-                    return availableSdks.FirstOrDefault(s => SemVersion.Parse(s.DisplayVersion) == sv);
+                    return value ?? availableSdks
+                        .Select(s => s.DisplayVersion is not null && SemVersion.Parse(s.DisplayVersion) == sv ? s : (DotnetSdk?)null)
+                        .FirstOrDefault();
                 }
 
                 // latest 패턴
@@ -394,12 +389,12 @@ internal sealed class InstallCommand(HttpClient hc) : AsyncCommand<InstallComman
             return ValidationResult.Error("This program only supports downloading the .NET SDK, not the runtime.");
         }
 
-        if (settings.Version is not null && !Regex.IsMatch(settings.Version, @"([0-9]+(\.[0-9]+\.([0-9]{3,3}|[0-9]xx|x))?|lts|latest)")) {
+        if (settings.Version is not null && !Regex.IsMatch(settings.Version, @"^([0-9]+(\.[0-9]+\.([0-9]{3,3}|[0-9]xx|x))?|lts|latest)$")) {
             return ValidationResult.Error("""
                                           Invalid version format. Please use the following format:
                                             - 9.0.100 (exact version)
                                             - 9.0.1xx (latest patch of major.minor.feature band)
-                                            - 9.0.x (latest major.minor.patch)
+                                            - 9.0.x (latest feature band and patch of major.minor)
                                             - 9 (latest version of major version)
                                             - lts (latest long-term support version)
                                             - latest (latest stable version)

@@ -8,6 +8,10 @@ internal static class Constants {
 
     public static string OSName {
         get {
+            if (OperatingSystem.IsWindows()) {
+                return "win";
+            }
+
             if (OperatingSystem.IsLinux()) {
                 return "linux";
             }
